@@ -4,7 +4,7 @@ from torch import nn
 from transformers import NVGPTConfig
 from torch import Tensor, Size
 
-from engine.adapter_engine import LORA_ENGINE
+from vllm.engine.adapter_engine import LORA_ENGINE
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import PagedAttentionWithRoPE, PagedAttention

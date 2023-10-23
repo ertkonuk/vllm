@@ -23,7 +23,7 @@ class Task:
         self.state_dict = None
         self.config: LoRAConfig = None
         self.weights = None
-        self.dtype = torch.bfloat16 # default
+        self.dtype = torch.float16 # default
 
     def get_name(self):
         return self.name
@@ -118,7 +118,7 @@ class LoRAEngine:
     """
     def __init__(self, model_config):
         self.base_model_name = model_config.model
-        self.metadata_path = os.path.join(model_config.lora_model_path, "metadata.json")
+        self.metadata_path = os.path.join("/mnt/nvdl/datasets/inference-engines/projects/nemollm/checkpoints/llama2-7Bf/lora_checkpoints/", "metadata.json")
         self.load_metadata()
         self.create_tasks()
         self.preload_all_checkpoints(model_config.lora_model_path)
@@ -137,10 +137,21 @@ class LoRAEngine:
                 print(f'Skipping {entry["filename"]} as it is not compatible with {self.base_model_name}')
     
     def preload_all_checkpoints(self, directory):
+        import tarfile
+        import io
         for task in self.tasks.values():
             filepath = os.path.join(directory, task.filename)
             if os.path.exists(filepath):
-                task.set_state_dict(torch.load(filepath, map_location='cuda:0')) # @TODO (tugrul): extend this to multi-GPU
+                
+                with open(filepath, 'rb') as f:
+
+                    tar_in_mem = io.BytesIO(f.read())
+                    tar = tarfile.open(fileobj=tar_in_mem)
+                    model_weights = tar.extractfile("./mp_rank_00/model_weights.ckpt")
+                    state_dict = torch.load(model_weights, map_location='cuda:0')
+                    new_state_dict = {k: v.to(dtype=torch.float16) if v.dtype == torch.bfloat16 else v for k, v in state_dict.items()}
+                    task.set_state_dict(new_state_dict)
+                # task.set_state_dict(torch.load(filepath, map_location='cuda:0')) # @TODO (tugrul): extend this to multi-GPU
                 dtype = task.dtype
                 task.convert_sd_to_dtype(dtype)
 
@@ -161,5 +172,5 @@ class ModelConfigSimple:
 
 #TODO: khadkevich move to singleton and remove hardcoded values
 LORA_ENGINE = LoRAEngine(
-    model_config=ModelConfigSimple(lora_model_path='/hub/lora/', model='nvgpt-2b-001')
+    model_config=ModelConfigSimple(lora_model_path='/mnt/nvdl/datasets/inference-engines/projects/nemollm/checkpoints/llama2-7Bf/lora_checkpoints/', model='llama2-7Bf')
 )
