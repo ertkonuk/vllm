@@ -31,6 +31,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from vllm.engine.adapter_engine import LORA_ENGINE
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -43,9 +44,14 @@ from vllm.model_executor.parallel_utils.parallel_state import (
 from vllm.model_executor.parallel_utils.tensor_parallel import (
     VocabParallelEmbedding, ColumnParallelLinear, RowParallelLinear)
 from vllm.sequence import SequenceOutputs
+from vllm.model_executor.models.nvgpt import LoraLayer
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
+def get_lora_keys(id):
+    in_key=f'model.language_model.encoder.layers.{id}.self_attention.adapter_layer.lora_kqv_adapter.linear_in.weight'
+    out_key=f'model.language_model.encoder.layers.{id}.self_attention.adapter_layer.lora_kqv_adapter.linear_out.weight'
+    return in_key, out_key
 
 class LlamaMLP(nn.Module):
 
@@ -70,6 +76,8 @@ class LlamaMLP(nn.Module):
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
+        self.lora_layer = LoraLayer(in_features=hidden_size, 
+                            out_features=3 * hidden_size, dim=32)
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
@@ -115,6 +123,9 @@ class LlamaAttention(nn.Module):
                                            self.scaling,
                                            rotary_dim=self.head_dim)
 
+        self.lora_layer = LoraLayer(in_features=hidden_size, 
+                                    out_features=3 * hidden_size, dim=32)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -122,8 +133,30 @@ class LlamaAttention(nn.Module):
         kv_cache: KVCache,
         input_metadata: InputMetadata,
         cache_event: Optional[torch.cuda.Event],
+        layer_id: Optional[int] = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        # Iterate over customizations (LoRAs/p-tuning) for each inference request
+        if input_metadata.customization_ids:
+            in_key, out_key = get_lora_keys(layer_id)
+            if len(input_metadata.prompt_lens) == 0:
+                lens = [1 for _ in range(input_metadata.num_valid_tokens)]
+            else: 
+                lens = input_metadata.prompt_lens
+            lora_qkv = torch.zeros_like(qkv)
+            start = 0
+            for k, req_len in enumerate(lens):  # req_len: length of the current request
+                # get peft weights for a customization_id
+                task = LORA_ENGINE.get_task(input_metadata.customization_ids[k]) if input_metadata.customization_ids[k] else None
+                if task:
+                    lora_weights = task.get_state_dict()
+                    linear_in_weight  = lora_weights[in_key]
+                    linear_out_weight = lora_weights[out_key]
+                    end = start + req_len
+                    lora_qkv[start:end], _ = self.lora_layer(hidden_states[start:end], linear_in_weight, linear_out_weight)
+                    start += req_len
+
+            qkv = qkv + lora_qkv
         q, k, v = qkv.chunk(chunks=3, dim=-1)
         k_cache, v_cache = kv_cache
         attn_output = self.attn(positions, q, k, v, k_cache, v_cache,
@@ -134,7 +167,7 @@ class LlamaAttention(nn.Module):
 
 class LlamaDecoderLayer(nn.Module):
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, id: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(
@@ -150,7 +183,7 @@ class LlamaDecoderLayer(nn.Module):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
-
+        self.id = id
     def forward(
         self,
         positions: torch.Tensor,
@@ -168,6 +201,7 @@ class LlamaDecoderLayer(nn.Module):
             kv_cache=kv_cache,
             input_metadata=input_metadata,
             cache_event=cache_event,
+            layer_id=self.id,
         )
         hidden_states = residual + hidden_states
 
@@ -192,7 +226,7 @@ class LlamaModel(nn.Module):
             config.hidden_size,
             perform_initialization=False)
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)
+            LlamaDecoderLayer(config, id=id) for id in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
