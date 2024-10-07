@@ -40,7 +40,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files, filter_files_not_needed_for_inference,
     get_gguf_extra_tensor_names, get_quant_config, gguf_quant_weights_iterator,
     initialize_dummy_weights, np_cache_weights_iterator, pt_weights_iterator,
-    safetensors_weights_iterator)
+    safetensors_weights_iterator, nemo_weights_iterator)
 from vllm.model_executor.models.interfaces import (has_inner_state,
                                                    supports_lora,
                                                    supports_multimodal)
@@ -48,6 +48,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import is_pin_memory_available
 
+NEMO_MODEL_WEIGHTS_DIR = 'model_weights'
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module,
@@ -283,6 +284,8 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns = ["*.pt"]
         elif load_format == LoadFormat.NPCACHE:
             allow_patterns = ["*.bin"]
+        elif load_format == LoadFormat.NEMO:
+            allow_patterns = ["*.nemo"]
         else:
             raise ValueError(f"Unknown load_format: {load_format}")
 
@@ -1197,7 +1200,115 @@ class GGUFModelLoader(BaseModelLoader):
                 self._get_weights_iterator(local_model_path, gguf_weights_map))
         return model
 
+class NemoModelLoader(BaseModelLoader):
+    """Model loader that can load NeMo models in extracted distributed mcore checkpoint format from disk."""
 
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        self.mem_efficient_load = True # ToDo (tugrul): this should not be hardcoded
+        if load_config.model_loader_extra_config:
+            raise ValueError(f"Model loader extra config is not supported for "
+                             f"load format {load_config.load_format}")
+
+    def _maybe_extract_nemo_file(self, nemo_file: str):
+        """Extract or fuse tar if the model is in .nemo format.
+        
+        Not implemented! We assume the nemo checkpoints are already extracted."""
+        pass
+
+    def _get_model_weights_list(self, model_path):
+        weight_directories = [
+            d for d in os.listdir(model_path) 
+            if os.path.isdir(os.path.join(model_path, d)) and not d.endswith('._extra_state')
+            ]
+        return weight_directories
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        self._prepare_weights(model_config.model,
+                              model_config.revision,
+                              fall_back_to_pt=True)
+        
+    def _prepare_weights(self, model_name_or_path: str,
+                         revision: Optional[str],
+                         fall_back_to_pt: bool) -> Tuple[str, List[str], bool]:
+        """Prepare weights for the model.
+
+        If the model is not extracted, it will be extracted."""
+        logger.debug("Preparing NeMo model weights...")
+        is_local = os.path.isdir(model_name_or_path)
+        use_safetensors = False
+        allow_patterns = ["*.nemo", "*.pt"] # Not used for now. We will need this when we use the quantized Nemotron-4 model
+        if fall_back_to_pt:
+            allow_patterns = ["*.pt"]
+
+        if is_local:
+            nemo_weights_folder = os.path.join(model_name_or_path, NEMO_MODEL_WEIGHTS_DIR)
+        else:
+            raise FileNotFoundError(f"Could not find the weights for {model_name_or_path}.")
+
+        nemo_weights_files: List[str] = self._get_model_weights_list(nemo_weights_folder)
+
+        if len(nemo_weights_files) == 0:
+            raise RuntimeError(
+                f"Cannot find any model weights with `{nemo_weights_folder}`")
+
+        logger.debug("NeMo model weights prepared.")
+        return nemo_weights_folder, nemo_weights_files, use_safetensors
+
+    def _get_weights_iterator(
+        self, model_name_or_path: str, revision: Optional[str],
+        fall_back_to_pt: bool
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Get an iterator for the model weights based on the load format."""
+        hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
+            model_name_or_path, revision, fall_back_to_pt)
+
+        if self.load_config.load_format == LoadFormat.NEMO:
+            return nemo_weights_iterator(hf_folder, hf_weights_files, self.mem_efficient_load)
+        elif self.load_config.load_format == LoadFormat.NPCACHE:
+            # Currently np_cache only support *.bin checkpoints
+            assert use_safetensors is False
+            return np_cache_weights_iterator(model_name_or_path,
+                                             self.load_config.download_dir,
+                                             hf_folder, hf_weights_files)
+        if use_safetensors:
+            return safetensors_weights_iterator(hf_weights_files)
+        return pt_weights_iterator(hf_weights_files)
+        
+    def load_model(self, *, model_config: ModelConfig,
+                   device_config: DeviceConfig,
+                   lora_config: Optional[LoRAConfig],
+                   parallel_config: ParallelConfig,
+                   scheduler_config: SchedulerConfig,
+                   cache_config: CacheConfig) -> nn.Module:
+
+        logger.debug("Loading NeMo model...")
+        with set_default_torch_dtype(model_config.dtype):
+            print('-'*100)
+            print(f"{device_config.device = }")
+            print(f"{model_config.dtype = }")
+            print('-'*100)
+            
+            with torch.device(device_config.device):
+                model = _initialize_model(model_config, self.load_config,
+                                          lora_config, cache_config, scheduler_config)
+            logger.debug("NeMo model initialized. Loading weights...")
+            model.load_weights(
+                self._get_weights_iterator(model_config.model,
+                                           model_config.revision,
+                                           fall_back_to_pt=getattr(
+                                               model,
+                                               "fall_back_to_pt_during_load",
+                                               True)), )
+            for _, module in model.named_modules():
+                linear_method = getattr(module, "linear_method", None)
+                if linear_method is not None:
+                    linear_method.process_weights_after_loading(module)
+                if hasattr(module, "process_weights_after_loading"):
+                    module.process_weights_after_loading()     
+        logger.debug("NeMo model loaded.")       
+        return model.eval()
+    
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
 
@@ -1218,5 +1329,8 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 
     if load_config.load_format == LoadFormat.GGUF:
         return GGUFModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.NEMO:
+        return NemoModelLoader(load_config)
 
     return DefaultModelLoader(load_config)

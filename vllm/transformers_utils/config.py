@@ -34,6 +34,8 @@ if VLLM_USE_MODELSCOPE:
 else:
     from transformers import AutoConfig
 
+_MODEL_FORMAT_NEMO = "nemo"
+
 MISTRAL_CONFIG_NAME = "params.json"
 
 logger = init_logger(__name__)

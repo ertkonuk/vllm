@@ -198,3 +198,6 @@ hip_compat.h
 
 # Benchmark dataset
 benchmarks/*.json
+
+# Runner
+run.py

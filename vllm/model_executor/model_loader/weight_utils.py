@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import tempfile
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
 
 import filelock
@@ -13,6 +13,7 @@ import gguf
 import huggingface_hub.constants
 import numpy as np
 import torch
+import tensorstore as ts
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from safetensors.torch import load_file, safe_open, save_file
 from tqdm.auto import tqdm
@@ -647,3 +648,110 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
 
     # If there were no matches, return the untouched param name
     return name
+
+
+# Utility to load NeMo models in MCore distributed checkpoint format
+# NeMo to vLLM module map maps the module names from nemo to vllm implementations. 
+# The second argument in every tuple denotes whether the module weights for all layers
+# are packed into a single array or not.
+# key: nemo_module_name -> value: (vllm_module_name, packed_layer_weights)
+NEMO_VLLM_MODULE_MAP = {
+    "model.output_layer.weight" : ("model.language_model.lm_head.weight", False),
+    "model.embedding.word_embeddings.weight" : ("model.language_model.model.embed_tokens.weight", False),
+    "model.decoder.final_layernorm.weight" : ("model.language_model.model.norm.weight", False),
+    "model.decoder.layers.self_attention.linear_qkv.layer_norm_weight": ("model.language_model.model.layers.input_layernorm.weight", True),
+    "model.decoder.layers.self_attention.linear_qkv.weight" : ("model.language_model.model.layers.self_attention.qkv_proj.weight", True),
+    "model.decoder.layers.self_attention.linear_proj.weight" : ("model.language_model.model.layers.self_attention.o_proj.weight", True),
+    "model.decoder.layers.mlp.linear_fc1.layer_norm_weight" : ("model.language_model.model.layers.post_attention_layernorm.weight", True),
+    "model.decoder.layers.mlp.linear_fc1.weight" : ("model.language_model.model.layers.mlp.gate_up_proj.weight", True),
+    "model.decoder.layers.mlp.linear_fc2.weight" : ("model.language_model.model.layers.mlp.down_proj.weight", True),
+    "model.output_layer.weight" : ("lm_head.weight", False),
+    "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector.0.weight" : ("model.vision_language_adapter.w_in.weight", False),
+    "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector.0.bias" : ("model.vision_language_adapter.w_in.bias", False),
+    "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector.2.weight" : ("model.vision_language_adapter.w_out.weight", False),
+    "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector.2.bias" : ("model.vision_language_adapter.w_out.bias", False),
+    }
+
+def open_tensorstore_array(arr_path):
+    """Opens a Zarr file array with Tensorstore with basic setting.
+
+    Arguments:
+        arr_path (Path): path to a Zarr (Tensorstore) array
+    """
+    spec = {'driver': 'zarr', 'metadata_key': '.zarray', 'kvstore': {}}
+    spec['kvstore'] = {
+        'driver': 'file',
+        'path': str(arr_path),
+    }
+    try:
+        arr = ts.open(ts.Spec(spec), open=True).result()
+    except Exception as e:
+        raise ValueError(f'Array {arr_path} could not be loaded. Error: {e}') from e
+    return arr
+
+def read_tensorstore_array(arr, slice_obj=None):
+    """Reads a portion of the Zarr array.
+
+    Arguments:
+        arr: Zarr array opened using open_tensorstore_array
+        slice_obj int: integer representing the slice of the array to read.
+            If None, the entire array is read. Default is None.
+    """
+    if slice_obj is None:
+        return arr.read().result()
+    else:
+        return arr[slice_obj].read().result()
+
+def postprocess_numpy_array(loaded_array):
+    x = loaded_array    
+    x = x.astype(np.dtype('float32'))
+    x = torch.from_numpy(x)
+    x = x.bfloat16()
+    return x
+
+def _inject_layer_num(name, layer_num):
+    parts = name.split("layers")
+    return f"layers.{layer_num}".join(parts)
+
+def build_nemo_state_dict(module_name, weights, needs_unpacking):
+    state_dict = OrderedDict()
+    if needs_unpacking:
+        for layer_num, layer_weight in enumerate(weights):
+            layer_name = _inject_layer_num(module_name, layer_num)
+            state_dict.update({layer_name : layer_weight})
+    else:
+        state_dict.update({module_name : weights}) 
+    return state_dict
+
+def nemo_weights_iterator(
+    nemo_folder: str,
+    nemo_weights_files: List[str],
+    mem_efficient_load: bool = False,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the Zarr/TensorStore files."""
+
+    def handle_weights(arr, module_name, needs_unpacking, mem_efficient):
+        if needs_unpacking and mem_efficient:
+            num_layers = arr.shape[0]
+            for layer_num in range(num_layers):
+                yield from process_module(arr, module_name, needs_unpacking=False, layer_num=layer_num)
+        else:
+            yield from process_module(arr, module_name, needs_unpacking)
+
+    def process_module(arr, module_name, needs_unpacking, layer_num=None):
+        arr_numpy = read_tensorstore_array(arr=arr, slice_obj=layer_num)
+        weights = postprocess_numpy_array(arr_numpy)
+        if layer_num is not None:
+            module_name = _inject_layer_num(module_name, layer_num)        
+
+        state = build_nemo_state_dict(module_name, weights, needs_unpacking)
+        for name, param in state.items():
+            yield name, param
+        del state
+        torch.cuda.empty_cache()
+
+    for module_weights_name in nemo_weights_files:
+        ts_file = os.path.join(nemo_folder, module_weights_name)
+        arr = open_tensorstore_array(ts_file)
+        module_name, needs_unpacking = NEMO_VLLM_MODULE_MAP[module_weights_name]
+        yield from handle_weights(arr, module_name, needs_unpacking, mem_efficient_load)
