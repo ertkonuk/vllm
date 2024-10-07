@@ -1219,7 +1219,7 @@ class NemoModelLoader(BaseModelLoader):
     def _get_model_weights_list(self, model_path):
         weight_directories = [
             d for d in os.listdir(model_path) 
-            if os.path.isdir(os.path.join(model_path, d)) and not d.endswith('._extra_state')
+            if os.path.isdir(os.path.join(model_path, d)) and d.startswith('model.') and not d.endswith('._extra_state')
             ]
         return weight_directories
 
@@ -1234,8 +1234,9 @@ class NemoModelLoader(BaseModelLoader):
         """Prepare weights for the model.
 
         If the model is not extracted, it will be extracted."""
-        logger.debug("Preparing NeMo model weights...")
+        logger.info("Preparing NeMo model weights...")
         is_local = os.path.isdir(model_name_or_path)
+        logger.info(f"{model_name_or_path = }")
         use_safetensors = False
         allow_patterns = ["*.nemo", "*.pt"] # Not used for now. We will need this when we use the quantized Nemotron-4 model
         if fall_back_to_pt:
@@ -1247,7 +1248,7 @@ class NemoModelLoader(BaseModelLoader):
             raise FileNotFoundError(f"Could not find the weights for {model_name_or_path}.")
 
         nemo_weights_files: List[str] = self._get_model_weights_list(nemo_weights_folder)
-
+        logger.info(f"{nemo_weights_files = }")
         if len(nemo_weights_files) == 0:
             raise RuntimeError(
                 f"Cannot find any model weights with `{nemo_weights_folder}`")
@@ -1282,19 +1283,15 @@ class NemoModelLoader(BaseModelLoader):
                    scheduler_config: SchedulerConfig,
                    cache_config: CacheConfig) -> nn.Module:
 
-        logger.debug("Loading NeMo model...")
-        with set_default_torch_dtype(model_config.dtype):
-            print('-'*100)
-            print(f"{device_config.device = }")
-            print(f"{model_config.dtype = }")
-            print('-'*100)
-            
+        logger.info("Loading NeMo model...")
+        with set_default_torch_dtype(model_config.dtype):            
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config,
                                           lora_config, cache_config, scheduler_config)
-            logger.debug("NeMo model initialized. Loading weights...")
+            logger.info("NeMo model initialized. Loading weights...")
+            logger.info(f"{self.load_config.download_dir = }")
             model.load_weights(
-                self._get_weights_iterator(model_config.model,
+                self._get_weights_iterator(self.load_config.download_dir,
                                            model_config.revision,
                                            fall_back_to_pt=getattr(
                                                model,
@@ -1306,7 +1303,7 @@ class NemoModelLoader(BaseModelLoader):
                     linear_method.process_weights_after_loading(module)
                 if hasattr(module, "process_weights_after_loading"):
                     module.process_weights_after_loading()     
-        logger.debug("NeMo model loaded.")       
+        logger.info("NeMo model loaded.")       
         return model.eval()
     
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:

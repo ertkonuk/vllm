@@ -656,20 +656,20 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
 # are packed into a single array or not.
 # key: nemo_module_name -> value: (vllm_module_name, packed_layer_weights)
 NEMO_VLLM_MODULE_MAP = {
-    "model.output_layer.weight" : ("model.language_model.lm_head.weight", False),
-    "model.embedding.word_embeddings.weight" : ("model.language_model.model.embed_tokens.weight", False),
-    "model.decoder.final_layernorm.weight" : ("model.language_model.model.norm.weight", False),
-    "model.decoder.layers.self_attention.linear_qkv.layer_norm_weight": ("model.language_model.model.layers.input_layernorm.weight", True),
-    "model.decoder.layers.self_attention.linear_qkv.weight" : ("model.language_model.model.layers.self_attention.qkv_proj.weight", True),
-    "model.decoder.layers.self_attention.linear_proj.weight" : ("model.language_model.model.layers.self_attention.o_proj.weight", True),
-    "model.decoder.layers.mlp.linear_fc1.layer_norm_weight" : ("model.language_model.model.layers.post_attention_layernorm.weight", True),
-    "model.decoder.layers.mlp.linear_fc1.weight" : ("model.language_model.model.layers.mlp.gate_up_proj.weight", True),
-    "model.decoder.layers.mlp.linear_fc2.weight" : ("model.language_model.model.layers.mlp.down_proj.weight", True),
     "model.output_layer.weight" : ("lm_head.weight", False),
-    "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector.0.weight" : ("model.vision_language_adapter.w_in.weight", False),
-    "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector.0.bias" : ("model.vision_language_adapter.w_in.bias", False),
-    "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector.2.weight" : ("model.vision_language_adapter.w_out.weight", False),
-    "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector.2.bias" : ("model.vision_language_adapter.w_out.bias", False),
+    "model.embedding.word_embeddings.weight" : ("model.embed_tokens.weight", False),
+    "model.decoder.final_layernorm.weight" : ("model.norm.weight", False),
+    "model.decoder.layers.self_attention.linear_qkv.layer_norm_weight": ("model.layers.input_layernorm.weight", True),
+    "model.decoder.layers.self_attention.linear_qkv.weight" : ("model.layers.self_attn.qkv_proj.weight", True),
+    "model.decoder.layers.self_attention.linear_proj.weight" : ("model.layers.self_attn.o_proj.weight", True),
+    "model.decoder.layers.mlp.linear_fc1.layer_norm_weight" : ("model.layers.post_attention_layernorm.weight", True),
+    "model.decoder.layers.mlp.linear_fc1.weight" : ("model.layers.mlp.gate_up_proj.weight", True),
+    "model.decoder.layers.mlp.linear_fc2.weight" : ("model.layers.mlp.down_proj.weight", True),
+    "model.output_layer.weight" : ("lm_head.weight", False),
+    "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector.0.weight" : ("vision_language_adapter.w_in.weight", False),
+    "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector.0.bias" : ("vision_language_adapter.w_in.bias", False),
+    "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector.2.weight" : ("vision_language_adapter.w_out.weight", False),
+    "model.embedding.word_embeddings.adapter_layer.mm_projector_adapter.mm_projector.2.bias" : ("vision_language_adapter.w_out.bias", False),
     }
 
 def open_tensorstore_array(arr_path):

@@ -27,7 +27,9 @@ from vllm.sequence import IntermediateTensors, SequenceData
 
 from .interfaces import SupportsMultiModal
 from .utils import init_vllm_registered_model
+from vllm.logger import init_logger
 
+logger = init_logger(__name__)
 
 def get_max_pixtral_image_tokens(ctx: InputContext):
     tokenizer = cached_get_tokenizer(
@@ -250,10 +252,12 @@ class PixtralForConditionalGeneration(nn.Module, SupportsMultiModal):
         def is_vision_weights(weight: Tuple[str, torch.Tensor]):
             return is_vision_encoder_weights(
                 weight) or is_vision_lang_adapter_weights(weight)
-
+        
         llm_weights, vision_encoder_weights, vision_lang_adapter_weights = tee(
             weights, 3)
 
+        #for name, weight in llm_weights:
+        #    print(f"{name = }")
         # llm
         llm_weights = filter(lambda x: not is_vision_weights(x), llm_weights)
         self.language_model.load_weights(llm_weights)
